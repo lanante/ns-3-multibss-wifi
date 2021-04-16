@@ -1,8 +1,13 @@
-d1=1
-d2=1
-d3=10
-  maxAmpduSize=3000
-      duration=50
+d=8
+r=1
+  maxAmpduSize=65536
+      duration=5
     enablePcap=true
-    mcs=0
-../waf --run "wifi-spatial-reuse --d1=$d1 --d2=$d2 --d3=$d3 --mcs=$mcs -maxAmpduSize=$maxAmpduSize --enablePcap=$enablePcap --duration=$duration"
+    mcs=8
+    n=10
+    nBss=1
+    uplink=200
+
+rm ../*.pcap
+  
+../waf --run "wifi-spatial-reuse --uplinkA=${uplink} --uplinkB=${uplink} --d=$d --r=$r --mcs=$mcs -maxAmpduSize=$maxAmpduSize --enablePcap=$enablePcap --duration=$duration --n=$n --nBss=${nBss}" 

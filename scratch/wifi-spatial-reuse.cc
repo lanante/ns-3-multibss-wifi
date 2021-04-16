@@ -26,8 +26,8 @@
 //
 //                STA1          STA1
 //                 |              |
-//              d1 |              |d2
-//                 |       d3     |
+//               r |              |r
+//                 |       d      |
 //                AP1 -----------AP2
 //
 //  STA1 and AP1 are in one BSS (with color set to 1), while STA2 and AP2 are in
@@ -80,14 +80,15 @@
 
 using namespace ns3;
 
-std::vector<uint32_t> bytesReceived (4);
-
+std::vector<uint64_t> bytesReceived (0);
+std::vector<uint64_t> packetsReceived (0);
 uint32_t
 ContextToNodeId (std::string context)
 {
-  std::string sub = context.substr (10);
+  std::string sub = context.substr (10); // skip "/NodeList/"
   uint32_t pos = sub.find ("/Device");
-  return atoi (sub.substr (0, pos).c_str ());
+  uint32_t nodeId = atoi (sub.substr (0, pos).c_str ());
+  return nodeId;
 }
 
 void
@@ -97,13 +98,39 @@ SocketRx (std::string context, Ptr<const Packet> p, const Address &addr)
   bytesReceived[nodeId] += p->GetSize ();
 }
 
+void
+AddClient (ApplicationContainer &clientApps, Ipv4Address address, Ptr<Node> node, uint16_t port,
+           Time interval, uint32_t payloadSize)
+{
+  UdpClientHelper client (address, port);
+  client.SetAttribute ("Interval", TimeValue (interval));
+  client.SetAttribute ("MaxPackets", UintegerValue (4294967295u));
+  client.SetAttribute ("PacketSize", UintegerValue (payloadSize));
+  clientApps.Add (client.Install (node));
+}
+void
+AddServer (ApplicationContainer &serverApps, UdpServerHelper &server, Ptr<Node> node)
+{
+  serverApps.Add (server.Install (node));
+}
+void
+PacketRx (std::string context, const Ptr<const Packet> p, const Address &srcAddress,
+          const Address &destAddress)
+{
+
+  uint32_t nodeId = ContextToNodeId (context);
+  
+  uint32_t pktSize = p->GetSize ();
+  bytesReceived[nodeId] += pktSize;
+  packetsReceived[nodeId]++;
+
+}
 int
 main (int argc, char *argv[])
 {
   double duration = 10.0; // seconds
-  double d1 = 30.0; // meters
-  double d2 = 30.0; // meters
-  double d3 = 150.0; // meters
+  double d = 30.0; // meters
+  double r = 150.0; // meters
   double powSta1 = 10.0; // dBm
   double powSta2 = 10.0; // dBm
   double powAp1 = 21.0; // dBm
@@ -114,19 +141,27 @@ main (int argc, char *argv[])
   double ccaEdTrAp2 = -62; // dBm
   uint32_t payloadSize = 1500; // bytes
   uint32_t mcs = 0; // MCS value
-  double interval = 0.00001; // seconds
+    uint32_t n = 1; // MCS value
+        uint32_t nBss = 2; // MCS value
+ // double interval = 0.00001; // seconds
   bool enableObssPd = false;
   double obssPdThreshold = -72.0; // dBm
   uint32_t  maxAmpduSize=10000;
     bool enablePcap = 0;
-
+  double aggregateUplinkAMbps = 10;
+  double aggregateUplinkBMbps = 10;
+    double aggregateDownlinkAMbps = 0;
+  double aggregateDownlinkBMbps = 0;
+    uint32_t maxMissedBeacons = 4294967295;
+  
   CommandLine cmd (__FILE__);
   cmd.AddValue ("duration", "Duration of simulation (s)", duration);
-  cmd.AddValue ("interval", "Inter packet interval (s)", interval);
+ // cmd.AddValue ("interval", "Inter packet interval (s)", interval);
   cmd.AddValue ("enableObssPd", "Enable/disable OBSS_PD", enableObssPd);
-  cmd.AddValue ("d1", "Distance between STA1 and AP1 (m)", d1);
-  cmd.AddValue ("d2", "Distance between STA2 and AP2 (m)", d2);
-  cmd.AddValue ("d3", "Distance between AP1 and AP2 (m)", d3);
+  cmd.AddValue ("r", "Distance between STA and AP (m)", r);
+  cmd.AddValue ("d", "Distance between AP1 and AP2 (m)", d);
+    cmd.AddValue ("n", "Number of STAs", n);
+        cmd.AddValue ("nBss", "Number of BSS", nBss);
   cmd.AddValue ("powSta1", "Power of STA1 (dBm)", powSta1);
   cmd.AddValue ("powSta2", "Power of STA2 (dBm)", powSta2);
   cmd.AddValue ("powAp1", "Power of AP1 (dBm)", powAp1);
@@ -138,22 +173,120 @@ main (int argc, char *argv[])
   cmd.AddValue ("mcs", "The constant MCS value to transmit HE PPDUs", mcs);
   cmd.AddValue ("maxAmpduSize", "BE_MaxAmpduSize", maxAmpduSize);
     cmd.AddValue ("enablePcap", "enablePcap", enablePcap);
-
-    
+  cmd.AddValue ("uplinkA", "Aggregate uplink load, BSS-A(Mbps)", aggregateUplinkAMbps);
+  cmd.AddValue ("downlinkA", "Aggregate downlink load, BSS-A (Mbps)", aggregateDownlinkAMbps);
+      cmd.AddValue ("uplinkB", "Aggregate uplink load, BSS-B(Mbps)", aggregateUplinkBMbps);
+  cmd.AddValue ("downlinkB", "Aggregate downlink load, BSS-B (Mbps)", aggregateDownlinkBMbps);
     
   cmd.Parse (argc, argv);
 
   NodeContainer wifiStaNodes;
-  wifiStaNodes.Create (2);
+  //wifiStaNodes.Create (2);
 
   NodeContainer wifiApNodes;
-  wifiApNodes.Create (2);
+  //wifiApNodes.Create (2);
+  wifiApNodes.Create (nBss);
+  NodeContainer wifiStaNodesA;
+  NodeContainer wifiStaNodesB;
 
+  Ssid ssid;
+    NetDeviceContainer staDeviceA, apDeviceA;
+  NetDeviceContainer staDeviceB, apDeviceB;
+   uint32_t numNodes = nBss * (n + 1);
+  
+    double perNodeUplinkAMbps = aggregateUplinkAMbps / n;
+  double perNodeDownlinkAMbps = aggregateDownlinkAMbps / n;
+  Time intervalUplinkA = MicroSeconds (payloadSize * 8 / perNodeUplinkAMbps);
+  Time intervalDownlinkA = MicroSeconds (payloadSize * 8 / perNodeDownlinkAMbps);
+
+  double perNodeUplinkBMbps = aggregateUplinkBMbps / n;
+  double perNodeDownlinkBMbps = aggregateDownlinkBMbps / n;
+  Time intervalUplinkB = MicroSeconds (payloadSize * 8 / perNodeUplinkBMbps);
+  Time intervalDownlinkB = MicroSeconds (payloadSize * 8 / perNodeDownlinkBMbps);
+  
+    packetsReceived = std::vector<uint64_t> (numNodes);
+  bytesReceived = std::vector<uint64_t> (numNodes);
+  
+      Config::SetDefault ("ns3::QosTxop::UseExplicitBarAfterMissedBlockAck", BooleanValue (false));
+     uint32_t uMaxSlrc = std::numeric_limits<uint32_t>::max ();
+    Config::SetDefault ("ns3::WifiRemoteStationManager::MaxSlrc", UintegerValue (uMaxSlrc));
+    Config::SetDefault ("ns3::WifiRemoteStationManager::MaxSsrc", UintegerValue (uMaxSlrc));
+      Config::SetDefault ("ns3::WifiMacQueue::MaxDelay", TimeValue (MilliSeconds (duration * 1000)));
+    
+    
+    wifiStaNodesA.Create (n);
+  
+  if (nBss > 1)
+    {
+
+      wifiStaNodesB.Create (n);
+    }
+
+  MobilityHelper mobility;
+  Ptr<ListPositionAllocator> positionAlloc = CreateObject<ListPositionAllocator> ();
+
+  
+  double apPositionX[7] = {0,d,d*2,d*2,d,-d};
+ double apPositionY[7] = {0,0,0,d,d,d,d};
+   for (uint8_t i = 0; i < nBss; i++)
+    {
+      positionAlloc->Add (Vector (apPositionX[i], apPositionY[i], 0.0));
+    }
+    
+    
+   // Set position for STAs
+  int64_t streamNumber = 100;
+  Ptr<UniformDiscPositionAllocator> unitDiscPositionAllocator1 =
+      CreateObject<UniformDiscPositionAllocator> ();
+  unitDiscPositionAllocator1->AssignStreams (streamNumber);
+  // AP1 is at origin (x=x1, y=y1), with radius Rho=r
+  unitDiscPositionAllocator1->SetX (apPositionX[0]);
+  unitDiscPositionAllocator1->SetY (apPositionY[0]);
+  unitDiscPositionAllocator1->SetRho (r);
+  for (uint32_t i = 0; i < n; i++)
+    {
+      Vector v = unitDiscPositionAllocator1->GetNext ();
+      positionAlloc->Add (v);
+
+    }
+
+  if (nBss > 1)
+    {
+      Ptr<UniformDiscPositionAllocator> unitDiscPositionAllocator2 =
+          CreateObject<UniformDiscPositionAllocator> ();
+      unitDiscPositionAllocator2->AssignStreams (streamNumber + 1);
+      // AP2 is at origin (x=x2, y=y2), with radius Rho=r
+      unitDiscPositionAllocator2->SetX (apPositionX[1]);
+      unitDiscPositionAllocator2->SetY (apPositionY[1]);
+      unitDiscPositionAllocator2->SetRho (r);
+      for (uint32_t i = 0; i < n; i++)
+        {
+          Vector v = unitDiscPositionAllocator2->GetNext ();
+          positionAlloc->Add (v);
+        }
+    }
+
+
+
+  mobility.SetPositionAllocator (positionAlloc);
+  NodeContainer allNodes = NodeContainer (wifiApNodes, wifiStaNodesA);
+  if (nBss > 1)
+    {
+      allNodes = NodeContainer (allNodes, wifiStaNodesB);
+    }
+    mobility.Install (allNodes);
+  
+  
+  
   SpectrumWifiPhyHelper spectrumPhy;
   Ptr<MultiModelSpectrumChannel> spectrumChannel = CreateObject<MultiModelSpectrumChannel> ();
-  Ptr<FriisPropagationLossModel> lossModel = CreateObject<FriisPropagationLossModel> ();
-  spectrumChannel->AddPropagationLossModel (lossModel);
-  Ptr<ConstantSpeedPropagationDelayModel> delayModel = CreateObject<ConstantSpeedPropagationDelayModel> ();
+     		Ptr<LogDistancePropagationLossModel> lossModel = CreateObject<LogDistancePropagationLossModel> ();
+     // more prominent example values:
+  lossModel ->SetAttribute ("ReferenceDistance", DoubleValue (1));
+  lossModel ->SetAttribute ("Exponent", DoubleValue (3.5));
+ lossModel ->SetAttribute ("ReferenceLoss", DoubleValue (50));
+      spectrumChannel->AddPropagationLossModel (lossModel);  
+        Ptr<ConstantSpeedPropagationDelayModel> delayModel = CreateObject<ConstantSpeedPropagationDelayModel> ();
   spectrumChannel->SetPropagationDelayModel (delayModel);
 
   spectrumPhy.SetChannel (spectrumChannel);
@@ -162,7 +295,10 @@ main (int argc, char *argv[])
   spectrumPhy.SetPreambleDetectionModel ("ns3::ThresholdPreambleDetectionModel");
     spectrumPhy.SetPcapDataLinkType (WifiPhyHelper::DLT_IEEE802_11_RADIO);
 
-    Config::SetDefault ("ns3::QosTxop::UseExplicitBarAfterMissedBlockAck", BooleanValue (false));
+
+    
+    
+    
     
   WifiHelper wifi;
   wifi.SetStandard (WIFI_STANDARD_80211ac);
@@ -172,100 +308,105 @@ main (int argc, char *argv[])
                                "ObssPdLevel", DoubleValue (obssPdThreshold));
     }
 
+
+
+
   WifiMacHelper mac;
   std::ostringstream oss;
   oss << "VhtMcs" << mcs;
-  wifi.SetRemoteStationManager ("ns3::ConstantRateWifiManager",
-                                "DataMode", StringValue (oss.str ()),
-                                "ControlMode", StringValue (oss.str ()));
 
-  spectrumPhy.Set ("TxPowerStart", DoubleValue (powSta1));
-  spectrumPhy.Set ("TxPowerEnd", DoubleValue (powSta1));
-  spectrumPhy.Set ("CcaEdThreshold", DoubleValue (ccaEdTrSta1));
+
+
+  ssid = Ssid ("network-A");
+
+wifiStaNodes=wifiStaNodesA;
+double powAp=powAp1;
+double ccaEdTrAp=ccaEdTrAp1;
+double powSta=powSta1;
+double ccaEdTrSta=ccaEdTrSta1;
+//STA
+  spectrumPhy.Set ("TxPowerStart", DoubleValue (powSta));
+  spectrumPhy.Set ("TxPowerEnd", DoubleValue (powSta));
+  spectrumPhy.Set ("CcaEdThreshold", DoubleValue (ccaEdTrSta));
   spectrumPhy.Set ("RxSensitivity", DoubleValue (-92.0));
+  mac.SetType ("ns3::StaWifiMac", "MaxMissedBeacons", UintegerValue (maxMissedBeacons), "Ssid",
+               SsidValue (ssid));
+  wifi.SetRemoteStationManager ("ns3::ConstantRateWifiManager", "DataMode", StringValue (oss.str ()),
+                                    "ControlMode", StringValue ("VhtMcs0"));
+  staDeviceA = wifi.Install (spectrumPhy, mac, wifiStaNodes);
 
-  Ssid ssidA = Ssid ("A");
-  mac.SetType ("ns3::StaWifiMac",
-               "Ssid", SsidValue (ssidA));
-  NetDeviceContainer staDeviceA = wifi.Install (spectrumPhy, mac, wifiStaNodes.Get (0));
 
- 
-    
-  spectrumPhy.Set ("TxPowerStart", DoubleValue (powAp1));
-  spectrumPhy.Set ("TxPowerEnd", DoubleValue (powAp1));
-  spectrumPhy.Set ("CcaEdThreshold", DoubleValue (ccaEdTrAp1));
+//AP
+  spectrumPhy.Set ("TxPowerStart", DoubleValue (powAp));
+  spectrumPhy.Set ("TxPowerEnd", DoubleValue (powAp));
+  spectrumPhy.Set ("CcaEdThreshold", DoubleValue (ccaEdTrAp));
   spectrumPhy.Set ("RxSensitivity", DoubleValue (-92.0));
-
   mac.SetType ("ns3::ApWifiMac",
-               "Ssid", SsidValue (ssidA),
+               "Ssid", SsidValue (ssid),
                "EnableBeaconJitter", BooleanValue (true));
 
-  NetDeviceContainer apDeviceA = wifi.Install (spectrumPhy, mac, wifiApNodes.Get (0));
-    
- 
+  wifi.SetRemoteStationManager ("ns3::ConstantRateWifiManager", "DataMode",
+                                   StringValue (oss.str ()), "ControlMode",
+                                    StringValue ("VhtMcs0"));
+                                    
 
-  Ptr<WifiNetDevice> apDevice = apDeviceA.Get (0)->GetObject<WifiNetDevice> ();
-    apDevice->GetMac ()->SetAttribute ("BE_MaxAmpduSize", UintegerValue (maxAmpduSize));
+                                                                            
+   apDeviceA = wifi.Install (spectrumPhy, mac, wifiApNodes.Get (0));
 
-  Ptr<ApWifiMac> apWifiMac = apDevice->GetMac ()->GetObject<ApWifiMac> ();
-  if (enableObssPd)
+
+
+ if (nBss > 1)
     {
-      apDevice->GetHeConfiguration ()->SetAttribute ("BssColor", UintegerValue (1));
-    }
 
-  spectrumPhy.Set ("TxPowerStart", DoubleValue (powSta2));
-  spectrumPhy.Set ("TxPowerEnd", DoubleValue (powSta2));
-  spectrumPhy.Set ("CcaEdThreshold", DoubleValue (ccaEdTrSta2));
+      // network B
+      ssid = Ssid ("network-B");
+
+
+wifiStaNodes=wifiStaNodesB;
+double powAp=powAp2;
+double ccaEdTrAp=ccaEdTrAp2;
+double powSta=powSta2;
+double ccaEdTrSta=ccaEdTrSta2;
+//STA
+  spectrumPhy.Set ("TxPowerStart", DoubleValue (powSta));
+  spectrumPhy.Set ("TxPowerEnd", DoubleValue (powSta));
+  spectrumPhy.Set ("CcaEdThreshold", DoubleValue (ccaEdTrSta));
   spectrumPhy.Set ("RxSensitivity", DoubleValue (-92.0));
+  mac.SetType ("ns3::StaWifiMac", "MaxMissedBeacons", UintegerValue (maxMissedBeacons), "Ssid",
+               SsidValue (ssid));
+  wifi.SetRemoteStationManager ("ns3::ConstantRateWifiManager", "DataMode", StringValue (oss.str ()),
+                                    "ControlMode", StringValue ("VhtMcs0"));                                                        
+  staDeviceB = wifi.Install (spectrumPhy, mac, wifiStaNodes);
+                                                           
 
-  Ssid ssidB = Ssid ("B");
-  mac.SetType ("ns3::StaWifiMac",
-               "Ssid", SsidValue (ssidB));
-  NetDeviceContainer staDeviceB = wifi.Install (spectrumPhy, mac, wifiStaNodes.Get (1));
-
-   
-  spectrumPhy.Set ("TxPowerStart", DoubleValue (powAp2));
-  spectrumPhy.Set ("TxPowerEnd", DoubleValue (powAp2));
-  spectrumPhy.Set ("CcaEdThreshold", DoubleValue (ccaEdTrAp2));
+//AP
+  spectrumPhy.Set ("TxPowerStart", DoubleValue (powAp));
+  spectrumPhy.Set ("TxPowerEnd", DoubleValue (powAp));
+  spectrumPhy.Set ("CcaEdThreshold", DoubleValue (ccaEdTrAp));
   spectrumPhy.Set ("RxSensitivity", DoubleValue (-92.0));
-
   mac.SetType ("ns3::ApWifiMac",
-               "Ssid", SsidValue (ssidB),
+               "Ssid", SsidValue (ssid),
                "EnableBeaconJitter", BooleanValue (true));
+  wifi.SetRemoteStationManager ("ns3::ConstantRateWifiManager", "DataMode",
+                                   StringValue (oss.str ()), "ControlMode",
+                                    StringValue ("VhtMcs0"));
+   apDeviceB = wifi.Install (spectrumPhy, mac, wifiApNodes.Get (1));
+    //  Ptr<WifiNetDevice> apDevice = apDeviceB.Get (0)->GetObject<WifiNetDevice> ();
+  //  apDevice->GetMac ()->SetAttribute ("BE_MaxAmpduSize", UintegerValue (maxAmpduSize));
+  
+}
 
-  NetDeviceContainer apDeviceB = wifi.Install (spectrumPhy, mac, wifiApNodes.Get (1));
-
-    
-    
-  Ptr<WifiNetDevice> ap2Device = apDeviceB.Get (0)->GetObject<WifiNetDevice> ();
-    ap2Device->GetMac ()->SetAttribute ("BE_MaxAmpduSize", UintegerValue (maxAmpduSize));
-
-  apWifiMac = ap2Device->GetMac ()->GetObject<ApWifiMac> ();
-  if (enableObssPd)
-    {
-      ap2Device->GetHeConfiguration ()->SetAttribute ("BssColor", UintegerValue (2));
-    }
-
-  MobilityHelper mobility;
-  Ptr<ListPositionAllocator> positionAlloc = CreateObject<ListPositionAllocator> ();
-  positionAlloc->Add (Vector (0.0, 0.0, 0.0)); // AP1
-  positionAlloc->Add (Vector (d3, 0.0, 0.0));  // AP2
-  positionAlloc->Add (Vector (0.0, d1, 0.0));  // STA1
-  positionAlloc->Add (Vector (d3, d2, 0.0));   // STA2
-  mobility.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
-  mobility.SetPositionAllocator (positionAlloc);
-  mobility.Install (wifiApNodes);
-  mobility.Install (wifiStaNodes);
 
     // Internet stack
     InternetStackHelper stack;
-    stack.Install (wifiApNodes);
-    stack.Install (wifiStaNodes);
+  stack.Install (allNodes);
 
-    Ipv4AddressHelper address;
+
+  
+    Ipv4AddressHelper address; 
     address.SetBase ("192.168.1.0", "255.255.255.0");
-    Ipv4InterfaceContainer StaInterfaceA;
-    StaInterfaceA = address.Assign (staDeviceA);
+    Ipv4InterfaceContainer StaInterfaceA; 
+    StaInterfaceA = address.Assign (staDeviceA);    
     Ipv4InterfaceContainer ApInterfaceA;
     ApInterfaceA = address.Assign (apDeviceA);
 
@@ -276,60 +417,117 @@ main (int argc, char *argv[])
     ApInterfaceB = address.Assign (apDeviceB);
 
     // Setting applications
-    uint16_t port = 9;
-    UdpServerHelper serverA (port);
-    ApplicationContainer serverAppA = serverA.Install (wifiStaNodes.Get (0));
-    serverAppA.Start (Seconds (0.0));
-    serverAppA.Stop (Seconds (duration + 1));
+ApplicationContainer uplinkServerApps;
+  ApplicationContainer downlinkServerApps;
+  ApplicationContainer uplinkClientApps;
+  ApplicationContainer downlinkClientApps;
 
-    UdpClientHelper clientA (StaInterfaceA.GetAddress (0), port);
-    clientA.SetAttribute ("MaxPackets", UintegerValue (4294967295u));
-    clientA.SetAttribute ("Interval", TimeValue (Seconds (interval))); //packets/s
-    clientA.SetAttribute ("PacketSize", UintegerValue (payloadSize));
+  uint16_t uplinkPortA = 9;
+  uint16_t downlinkPortA = 10;
+  UdpServerHelper uplinkServerA (uplinkPortA);
+  UdpServerHelper downlinkServerA (downlinkPortA);
 
-    ApplicationContainer clientAppA = clientA.Install (wifiApNodes.Get (0));
-    clientAppA.Start (Seconds (1.0));
-    clientAppA.Stop (Seconds (duration + 1));
+  for (uint32_t i = 0; i < n; i++)
+    {
+      if (aggregateUplinkAMbps > 0)
+        {
+          AddClient (uplinkClientApps, ApInterfaceA.GetAddress (0), wifiStaNodesA.Get (i),
+                     uplinkPortA, intervalUplinkA, payloadSize);
 
-    UdpServerHelper serverB (port);
-    ApplicationContainer serverAppB = serverB.Install (wifiStaNodes.Get (1));
-    serverAppB.Start (Seconds (0.0));
-    serverAppB.Stop (Seconds (duration + 1));
+        }
+      if (aggregateDownlinkAMbps > 0)
+        {
 
-    UdpClientHelper clientB (StaInterfaceB.GetAddress (0), port);
-    clientB.SetAttribute ("MaxPackets", UintegerValue (4294967295u));
-    clientB.SetAttribute ("Interval", TimeValue (Seconds (interval))); //packets/s
-    clientB.SetAttribute ("PacketSize", UintegerValue (payloadSize));
+          AddClient (downlinkClientApps, StaInterfaceA.GetAddress (i), wifiApNodes.Get (0),
+                     downlinkPortA, intervalDownlinkA, payloadSize);
+          AddServer (downlinkServerApps, downlinkServerA, wifiStaNodesA.Get (i));
+        }
+    }
+  if (aggregateUplinkAMbps > 0)
+    {
+      AddServer (uplinkServerApps, uplinkServerA, wifiApNodes.Get (0));
+    }
 
-    ApplicationContainer clientAppB = clientB.Install (wifiApNodes.Get (1));
-    clientAppB.Start (Seconds (1.0));
-    clientAppB.Stop (Seconds (duration + 1));
-    
-    
-  
+  // BSS 2
+  if (nBss > 1)
+    {
+      uint16_t uplinkPortB = 11;
+      uint16_t downlinkPortB = 12;
+      UdpServerHelper uplinkServerB (uplinkPortB);
+      UdpServerHelper downlinkServerB (downlinkPortB);
+                                                                                             
+      for (uint32_t i = 0; i < n; i++)
+        {
+          if (aggregateUplinkBMbps > 0)
+            {
+              AddClient (uplinkClientApps, ApInterfaceB.GetAddress (0), wifiStaNodesB.Get (i),
+                         uplinkPortB, intervalUplinkB, payloadSize);
+            }
+
+          if (aggregateDownlinkBMbps > 0)
+            {
+
+              AddClient (downlinkClientApps, StaInterfaceB.GetAddress (i), wifiApNodes.Get (1),
+                         downlinkPortB, intervalDownlinkB, payloadSize);
+
+              AddServer (downlinkServerApps, downlinkServerB, wifiStaNodesB.Get (i));
+            }
+
+        }
+
+      if (aggregateUplinkBMbps > 0)
+        {
+          AddServer (uplinkServerApps, uplinkServerB, wifiApNodes.Get (1));
+        }
+    }
+
+  for (uint16_t i = 0; i < ((n + 1) * nBss); i++)
+    {
+      if (i < (n + 1)) // BSS 1
+        {
+          std::stringstream stmp;
+          stmp << "/NodeList/" << i << "/DeviceList/*/$ns3::WifiNetDevice/Mac/BE_MaxAmpduSize";
+          Config::Set (stmp.str (), UintegerValue (std::min (maxAmpduSize, 4194303u)));
+        }
+      else if (i < (2 * (n + 1))) // BSS 2
+        {
+          std::stringstream stmp;
+          stmp << "/NodeList/" << i << "/DeviceList/*/$ns3::WifiNetDevice/Mac/BE_MaxAmpduSize";
+          Config::Set (stmp.str (), UintegerValue (std::min (maxAmpduSize, 4194303u)));
+        }
+        }
+        
+        
     if (enablePcap)
       {
           spectrumPhy.EnablePcap ("AP_A", apDeviceA.Get (0));
           spectrumPhy.EnablePcap ("STA_A", staDeviceA.Get (0));
-          spectrumPhy.EnablePcap ("AP_B", apDeviceB.Get (0));
+          if (nBss>=2)
+          {
+                    spectrumPhy.EnablePcap ("AP_B", apDeviceB.Get (0));
           spectrumPhy.EnablePcap ("STA_B", staDeviceB.Get (0));
+          }
+          
       }
-    
-    
-  Simulator::Stop (Seconds (duration));
-  Simulator::Run ();
-    // Show results
-    uint64_t totalPacketsThroughA = DynamicCast<UdpServer> (serverAppA.Get (0))->GetReceived ();
-    uint64_t totalPacketsThroughB = DynamicCast<UdpServer> (serverAppB.Get (0))->GetReceived ();
 
+     Config::Connect ("/NodeList/*/ApplicationList/*/$ns3::UdpServer/RxWithAddresses",
+                  MakeCallback (&PacketRx));
+
+  Simulator::Stop (Seconds (duration+1));
+  Simulator::Run ();
 
   Simulator::Destroy ();
 
-    double throughput = totalPacketsThroughA * payloadSize * 8 / (duration * 1000000.0);
-    std::cout << "Throughput: " << throughput << " Mbit/s" << '\n';
-
-    throughput = totalPacketsThroughB * payloadSize * 8 / (duration * 1000000.0);
-    std::cout << "Throughput: " << throughput << " Mbit/s" << '\n';
+double rxThroughputPerNode[numNodes];
+  // output for all nodes
+  for (uint32_t k = 0; k < nBss; k++)
+    {
+      double bitsReceived = bytesReceived[k] * 8;
+      rxThroughputPerNode[k] = static_cast<double> (bitsReceived) / 1e6 / duration;
+      std::cout << "Node " << k << ", pkts " << packetsReceived[k] << ", bytes " << bytesReceived[k]
+                << ", throughput [MMb/s] " << rxThroughputPerNode[k] << std::endl;
+       //   TputFile << rxThroughputPerNode[k] << std::endl;
+    }
 
 
   return 0;
